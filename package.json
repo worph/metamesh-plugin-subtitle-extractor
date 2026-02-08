@@ -1,6 +1,7 @@
 {
   "name": "@metazla/plugin-subtitle-extractor",
   "version": "1.0.0",
+  "packageManager": "pnpm@10.28.0",
   "description": "MetaMesh plugin: Extracts embedded subtitles from video files",
   "type": "module",
   "main": "dist/index.js",
