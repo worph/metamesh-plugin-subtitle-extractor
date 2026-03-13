@@ -5,40 +5,49 @@
  * Republishes extracted subtitles in the pipeline (similar to TMDB plugin with posters).
  *
  * ============================================================================
- * PLUGIN MOUNT ARCHITECTURE - DO NOT MODIFY WITHOUT AUTHORIZATION
+ * PLUGIN FILE ACCESS ARCHITECTURE - WebDAV
  * ============================================================================
  *
- * Each plugin container has exactly 3 mounts:
+ * File access via WebDAV (WEBDAV_URL environment variable):
+ *   - Read media files:  GET  /webdav/watch/...  or /webdav/test/...
+ *   - Write output:      PUT  /webdav/plugin/subtitle-extractor/...
+ *   - Cache:             Local /cache mount (for temporary files during extraction)
  *
- *   1. /files              (READ-ONLY)  - Shared media files, read access only
- *   2. /cache              (READ-WRITE) - Plugin-specific cache folder
- *   3. /output             (READ-WRITE) - Plugin output folder for extracted subtitles
- *
- * SECURITY: Plugins must NEVER write to /files directly.
- * - Use /cache for temporary/cache data
- * - Use /output for output files (extracted subtitles)
+ * Benefits:
+ * - No need for /files or /output volume mounts
+ * - Works across multiple hosts
+ * - Plugins are fully isolated
  *
  * ============================================================================
  */
 
 import { spawn } from 'child_process';
-import { existsSync, mkdirSync, statSync, openSync, readSync, closeSync, unlinkSync } from 'fs';
+import { existsSync, mkdirSync, statSync, unlinkSync, readFileSync } from 'fs';
 import { createHash } from 'crypto';
 import * as path from 'path';
 import type { PluginManifest, ProcessRequest, CallbackPayload } from './types.js';
 import { MetaCoreClient } from './meta-core-client.js';
-import { createWebDAVClient, WebDAVClient } from './webdav-client.js';
+import { createWebDAVClient } from './webdav-client.js';
 
 // Initialize WebDAV client if WEBDAV_URL is set
 const webdavClient = createWebDAVClient();
 if (webdavClient) {
-    console.log('[subtitle-extractor] Using WebDAV for file access');
+    console.log('[subtitle-extractor] WebDAV client initialized for file access');
 } else {
-    console.log('[subtitle-extractor] Using direct filesystem access');
+    console.warn('[subtitle-extractor] WARNING: WEBDAV_URL not set - plugin will not be able to write output files');
 }
 
-// Output path for extracted subtitles
-const PLUGIN_OUTPUT_PATH = '/output';
+/**
+ * ============================================================================
+ * PLUGIN OUTPUT PATH - Written via WebDAV
+ * ============================================================================
+ * Output files (subtitles) are written via WebDAV PUT requests.
+ * Path: /files/plugin/subtitle-extractor/<filename> (accessible at WEBDAV_URL/plugin/subtitle-extractor/)
+ * TEMP_PATH (/cache/temp) - Local temp folder for ffmpeg extraction before WebDAV upload
+ * ============================================================================
+ */
+const PLUGIN_OUTPUT_WEBDAV_PATH = '/files/plugin/subtitle-extractor';
+const TEMP_PATH = '/cache/temp';
 
 // Image-based subtitle codecs that cannot be converted to text
 const UNSUPPORTED_SUBTITLE_CODECS = new Set([
@@ -102,30 +111,24 @@ export function configure(config: Record<string, unknown>): void {
 }
 
 /**
- * Compute midhash256 CID for a file (matches meta-hash algorithm)
+ * Compute midhash256 CID from a Buffer (matches meta-hash algorithm)
+ * Used for computing CID before/after WebDAV upload
  */
-function computeMidHash256Sync(filePath: string): string {
+function computeMidHash256FromBuffer(data: Buffer): string {
     const SAMPLE_SIZE = 1024 * 1024; // 1MB
     const MIDHASH_VARINT = Buffer.from([0x80, 0x20]);
 
-    const stats = statSync(filePath);
-    const fileSize = stats.size;
+    const fileSize = data.length;
 
     const sizeBuffer = Buffer.allocUnsafe(8);
     sizeBuffer.writeBigUInt64BE(BigInt(fileSize), 0);
 
     let sampleData: Buffer;
     if (fileSize <= SAMPLE_SIZE) {
-        const fd = openSync(filePath, 'r');
-        sampleData = Buffer.allocUnsafe(fileSize);
-        readSync(fd, sampleData, 0, fileSize, 0);
-        closeSync(fd);
+        sampleData = data;
     } else {
         const middleOffset = Math.floor((fileSize - SAMPLE_SIZE) / 2);
-        const fd = openSync(filePath, 'r');
-        sampleData = Buffer.allocUnsafe(SAMPLE_SIZE);
-        readSync(fd, sampleData, 0, SAMPLE_SIZE, middleOffset);
-        closeSync(fd);
+        sampleData = data.subarray(middleOffset, middleOffset + SAMPLE_SIZE);
     }
 
     const hashInput = Buffer.concat([sizeBuffer, sampleData]);
@@ -181,35 +184,46 @@ interface SubtitleStream {
 function parseSubtitleStreams(existingMeta: Record<string, string>): SubtitleStream[] {
     const streams: SubtitleStream[] = [];
 
-    // ffmpeg plugin stores streams as JSON in 'streams' field
-    // or as individual fields like 'subtitle_0_codec', 'subtitle_0_language', etc.
-    const streamsJson = existingMeta['streams'];
-    if (streamsJson) {
+    // ffmpeg plugin stores streams as 'stream' field - an array of JSON strings
+    // Each element is a stringified JSON object like:
+    // '{"type":"subtitle","codec":"ass","index":2,"language":"eng",...}'
+    const streamData = existingMeta['stream'];
+    if (streamData) {
         try {
-            const allStreams = JSON.parse(streamsJson) as Array<{
-                codec_type?: string;
-                codec_name?: string;
-                index?: number;
-                tags?: { language?: string; title?: string };
-            }>;
+            // Parse the outer array (it's already an array from meta-core)
+            const allStreams = Array.isArray(streamData)
+                ? streamData
+                : JSON.parse(streamData) as string[];
+
             let subtitleIndex = 0;
-            for (const stream of allStreams) {
-                if (stream.codec_type === 'subtitle') {
+            for (const streamStr of allStreams) {
+                // Each stream is a JSON string
+                const stream = typeof streamStr === 'string'
+                    ? JSON.parse(streamStr) as {
+                        type?: string;
+                        codec?: string;
+                        index?: number;
+                        language?: string;
+                        title?: string;
+                    }
+                    : streamStr;
+
+                if (stream.type === 'subtitle') {
                     streams.push({
                         index: subtitleIndex,
-                        codec: stream.codec_name || 'unknown',
-                        language: stream.tags?.language,
-                        title: stream.tags?.title,
+                        codec: stream.codec || 'unknown',
+                        language: stream.language,
+                        title: stream.title,
                     });
                     subtitleIndex++;
                 }
             }
-        } catch {
-            // Fall through to individual field parsing
+        } catch (e) {
+            console.error('[subtitle-extractor] Failed to parse stream metadata:', e);
         }
     }
 
-    // Fallback: parse individual fields
+    // Fallback: parse individual fields (legacy format)
     if (streams.length === 0) {
         for (let i = 0; i < 20; i++) {
             const codec = existingMeta[`subtitle_${i}_codec`];
@@ -357,16 +371,25 @@ export async function process(
 
         console.log(`[subtitle-extractor] Found ${textSubtitles.length} text-based subtitle(s) in ${filePath}`);
 
-        // Get input path (WebDAV URL or filesystem path)
-        let inputPath = filePath;
-        if (webdavClient) {
-            inputPath = webdavClient.toWebDAVUrl(filePath);
-            console.log(`[subtitle-extractor] Using WebDAV input: ${inputPath}`);
+        // Require WebDAV client for writing output
+        if (!webdavClient) {
+            console.error('[subtitle-extractor] WebDAV client not available, cannot write output files');
+            await sendCallback({
+                taskId: request.taskId,
+                status: 'failed',
+                duration: Date.now() - startTime,
+                error: 'WebDAV client not configured (WEBDAV_URL not set)',
+            });
+            return;
         }
 
-        // Ensure output directory exists
-        if (!existsSync(PLUGIN_OUTPUT_PATH)) {
-            mkdirSync(PLUGIN_OUTPUT_PATH, { recursive: true });
+        // Get input path (WebDAV URL for reading)
+        let inputPath = webdavClient.toWebDAVUrl(filePath);
+        console.log(`[subtitle-extractor] Using WebDAV input: ${inputPath}`);
+
+        // Ensure temp directory exists for ffmpeg extraction
+        if (!existsSync(TEMP_PATH)) {
+            mkdirSync(TEMP_PATH, { recursive: true });
         }
 
         // Get video title for output filename
@@ -380,37 +403,49 @@ export async function process(
 
         // Extract each subtitle
         for (const sub of textSubtitles) {
-            const langCode = sub.language || 'und';
             const langSuffix = sub.language ? `.${sub.language}` : `.${sub.index}`;
             const ext = outputFormat;
 
             // Build output filename: Title (Year)[videoCID]_subtitle.lang.srt
             const outputFilename = `${safeTitle}${yearStr}[${cid}]_subtitle${langSuffix}.${ext}`;
-            const outputPath = path.join(PLUGIN_OUTPUT_PATH, outputFilename);
+            const webdavOutputPath = `${PLUGIN_OUTPUT_WEBDAV_PATH}/${outputFilename}`;
+            const tempOutputPath = path.join(TEMP_PATH, outputFilename);
 
-            // Check if already extracted
-            if (existsSync(outputPath) && !forceRecompute) {
-                console.log(`[subtitle-extractor] Subtitle already exists: ${outputFilename}`);
-                try {
-                    const subtitleCid = computeMidHash256Sync(outputPath);
-                    extractedCids.push(subtitleCid);
-                    if (sub.language && !extractedLanguages.includes(sub.language)) {
-                        extractedLanguages.push(sub.language);
+            // Check if already extracted via WebDAV
+            if (!forceRecompute) {
+                const exists = await webdavClient.exists(webdavOutputPath);
+                if (exists) {
+                    console.log(`[subtitle-extractor] Subtitle already exists: ${outputFilename}`);
+                    // Read existing file to get CID
+                    try {
+                        const existingData = await webdavClient.readFile(webdavOutputPath);
+                        const subtitleCid = computeMidHash256FromBuffer(existingData);
+                        extractedCids.push(subtitleCid);
+                        if (sub.language && !extractedLanguages.includes(sub.language)) {
+                            extractedLanguages.push(sub.language);
+                        }
+                    } catch (e) {
+                        console.error(`[subtitle-extractor] Failed to read existing subtitle: ${e}`);
                     }
-                } catch (e) {
-                    console.error(`[subtitle-extractor] Failed to compute CID: ${e}`);
+                    continue;
                 }
-                continue;
             }
 
-            // Extract subtitle
-            const extracted = await extractSubtitle(inputPath, outputPath, sub.index, sub.codec);
+            // Extract subtitle to temp file
+            const extracted = await extractSubtitle(inputPath, tempOutputPath, sub.index, sub.codec);
 
             if (extracted) {
                 try {
-                    // Compute CID for the extracted subtitle file
-                    const subtitleCid = computeMidHash256Sync(outputPath);
+                    // Read extracted subtitle file
+                    const subtitleData = readFileSync(tempOutputPath);
+
+                    // Compute CID from buffer
+                    const subtitleCid = computeMidHash256FromBuffer(subtitleData);
                     console.log(`[subtitle-extractor] Subtitle CID: ${subtitleCid}`);
+
+                    // Upload to WebDAV
+                    await webdavClient.writeFile(webdavOutputPath, subtitleData);
+                    console.log(`[subtitle-extractor] Uploaded subtitle to WebDAV: ${webdavOutputPath}`);
 
                     extractedCids.push(subtitleCid);
                     if (sub.language && !extractedLanguages.includes(sub.language)) {
@@ -424,8 +459,13 @@ export async function process(
                     if (sub.language) {
                         await metaCore.addToSet(cid, 'subtitleLanguages', sub.language);
                     }
+
+                    // Clean up temp file
+                    try { unlinkSync(tempOutputPath); } catch {}
                 } catch (e) {
                     console.error(`[subtitle-extractor] Failed to process extracted subtitle: ${e}`);
+                    // Clean up temp file on error
+                    try { unlinkSync(tempOutputPath); } catch {}
                 }
             }
         }

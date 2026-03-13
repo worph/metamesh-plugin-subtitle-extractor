@@ -101,6 +101,28 @@ export class WebDAVClient {
     }
 
     /**
+     * Write file via HTTP PUT
+     */
+    async writeFile(filePath: string, data: Buffer | string): Promise<void> {
+        const url = this.toWebDAVUrl(filePath);
+
+        // Convert Buffer to Uint8Array for fetch compatibility
+        const body = typeof data === 'string' ? data : new Uint8Array(data);
+
+        const response = await fetch(url, {
+            method: 'PUT',
+            body,
+            headers: {
+                'Content-Type': 'application/octet-stream',
+            },
+        });
+
+        if (!response.ok) {
+            throw new Error(`WebDAV PUT failed for ${filePath}: ${response.status} ${response.statusText}`);
+        }
+    }
+
+    /**
      * Check if file exists via HTTP HEAD
      */
     async exists(filePath: string): Promise<boolean> {

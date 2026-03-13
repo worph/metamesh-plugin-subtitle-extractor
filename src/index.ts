@@ -2,17 +2,15 @@
  * MetaMesh Plugin: subtitle-extractor
  *
  * ============================================================================
- * PLUGIN MOUNT ARCHITECTURE - DO NOT MODIFY WITHOUT AUTHORIZATION
+ * PLUGIN FILE ACCESS ARCHITECTURE - WebDAV
  * ============================================================================
  *
- * Each plugin container has exactly 3 mounts:
+ * File access via WebDAV (WEBDAV_URL environment variable):
+ *   - Read media files:  GET  /webdav/watch/...  or /webdav/test/...
+ *   - Write output:      PUT  /webdav/plugin/subtitle-extractor/...
+ *   - Cache:             Local /cache mount (for temporary files during extraction)
  *
- *   1. /files              (READ-ONLY)  - Shared media files, read access only
- *   2. /cache              (READ-WRITE) - Plugin-specific cache folder
- *   3. /output             (READ-WRITE) - Plugin output folder for extracted subtitles
- *
- * SECURITY: Plugins must NEVER write to /files directly.
- * All write operations go to /cache or /output only.
+ * SECURITY: Plugins use WebDAV for all file access. No /files mount needed.
  *
  * ============================================================================
  */
