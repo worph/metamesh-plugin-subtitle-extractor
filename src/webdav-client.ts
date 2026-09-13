@@ -64,7 +64,8 @@ export class WebDAVClient {
     }
 
     /**
-     * Read bytes from a file via HTTP Range request
+     * Read first N bytes of a file (for magic byte detection)
+     * Uses HTTP Range request
      */
     async readBytes(filePath: string, start: number, end: number): Promise<Buffer> {
         const url = this.toWebDAVUrl(filePath);
@@ -85,7 +86,7 @@ export class WebDAVClient {
     }
 
     /**
-     * Read entire file as buffer (for small files)
+     * Read entire file as buffer (for small files only)
      */
     async readFile(filePath: string): Promise<Buffer> {
         const url = this.toWebDAVUrl(filePath);
@@ -106,12 +107,9 @@ export class WebDAVClient {
     async writeFile(filePath: string, data: Buffer | string): Promise<void> {
         const url = this.toWebDAVUrl(filePath);
 
-        // Convert Buffer to Uint8Array for fetch compatibility
-        const body = typeof data === 'string' ? data : new Uint8Array(data);
-
         const response = await fetch(url, {
             method: 'PUT',
-            body,
+            body: data,
             headers: {
                 'Content-Type': 'application/octet-stream',
             },
@@ -135,40 +133,67 @@ export class WebDAVClient {
             return false;
         }
     }
-
-    /**
-     * List directory contents via HTTP GET (returns JSON from nginx autoindex)
-     */
-    async readdir(dirPath: string): Promise<string[]> {
-        const url = this.toWebDAVUrl(dirPath);
-        const finalUrl = url.endsWith('/') ? url : url + '/';
-
-        const response = await fetch(finalUrl, {
-            method: 'GET',
-            headers: {
-                'Accept': 'application/json',
-            },
-        });
-
-        if (!response.ok) {
-            throw new Error(`WebDAV GET (dir) failed for ${dirPath}: ${response.status} ${response.statusText}`);
-        }
-
-        const entries = await response.json() as Array<{ name: string; type: string }>;
-        return entries.map(e => e.name);
-    }
 }
 
 /**
- * Create a WebDAV client from environment variables
+ * WebDAV client for the meta-core that drove a /process call.
+ *
+ * The endpoint is read from that core's own /urls (`webdavUrlInternal`),
+ * so blobs always land in the /files of the core we write metadata to. A feeder
+ * whose plugins run beside it but enrich a remote hub core needs no per-stack
+ * wiring, and it is impossible to write posters into one core while pointing
+ * CIDs at another.
+ *
+ * WEBDAV_URL still wins when set — an explicit override for tests and for
+ * topologies where the core's advertised internal URL isn't reachable from here.
+ *
+ * Resolutions are cached per meta-core URL; failures are not, so a core that is
+ * still starting up is retried on the next task.
  */
-export function createWebDAVClient(): WebDAVClient | null {
-    const webdavUrl = process.env.WEBDAV_URL;
+const clientCache = new Map<string, Promise<WebDAVClient | null>>();
 
-    if (!webdavUrl) {
-        console.warn('[webdav-client] WEBDAV_URL not set, WebDAV client unavailable');
-        return null;
+async function resolveWebDAVUrl(metaCoreUrl: string): Promise<string | null> {
+    // /urls, not /api/urls — metaCoreUrl points at the meta-core backend, whose
+    // discovery routes are unprefixed (same base the /meta/* writes use).
+    const base = metaCoreUrl.replace(/\/$/, '');
+    const response = await fetch(`${base}/urls`, { signal: AbortSignal.timeout(5000) });
+
+    if (!response.ok) {
+        throw new Error(`GET ${base}/urls failed: ${response.status} ${response.statusText}`);
     }
 
-    return new WebDAVClient(webdavUrl);
+    const urls = await response.json() as { webdavUrlInternal?: string; webdavUrl?: string };
+    return urls.webdavUrlInternal ?? urls.webdavUrl ?? null;
+}
+
+export async function getWebDAVClient(metaCoreUrl: string): Promise<WebDAVClient | null> {
+    const override = process.env.WEBDAV_URL;
+    if (override) {
+        return new WebDAVClient(override);
+    }
+
+    let pending = clientCache.get(metaCoreUrl);
+    if (!pending) {
+        pending = resolveWebDAVUrl(metaCoreUrl).then((webdavUrl) => {
+            if (!webdavUrl) {
+                console.warn(`[webdav-client] meta-core ${metaCoreUrl} advertises no WebDAV URL`);
+                return null;
+            }
+            console.log(`[webdav-client] Using WebDAV endpoint ${webdavUrl} (from ${metaCoreUrl})`);
+            return new WebDAVClient(webdavUrl);
+        });
+        clientCache.set(metaCoreUrl, pending);
+    }
+
+    try {
+        const client = await pending;
+        if (!client) {
+            clientCache.delete(metaCoreUrl);
+        }
+        return client;
+    } catch (error) {
+        clientCache.delete(metaCoreUrl);
+        console.warn(`[webdav-client] Failed to resolve WebDAV URL from ${metaCoreUrl}: ${error instanceof Error ? error.message : String(error)}`);
+        return null;
+    }
 }

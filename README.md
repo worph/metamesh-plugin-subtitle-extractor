@@ -1,157 +1,58 @@
 # MetaMesh Plugin: Subtitle Extractor
 
-Extracts embedded subtitles from video files and saves them as standalone text files. The extracted subtitles are republished in the MetaMesh pipeline and linked to the original video via CID.
+Extracts a video's embedded **text** subtitle streams into standalone files and links them to the video so clients (meta-watch) can offer them.
 
-## Features
+## What it writes (METADATA_KEYS.md §8 / §9)
 
-- **Automatic extraction**: Extracts all text-based subtitle tracks from video files
-- **Multiple formats**: Supports SRT, ASS, SSA, WebVTT, and MOV_TEXT codecs
-- **Smart filtering**: Automatically skips image-based subtitles (PGS, DVD, DVB) that cannot be converted to text
-- **Language preservation**: Maintains language metadata from video streams
-- **Pipeline integration**: Extracted files are saved to `/output` and automatically picked up by meta-sort
-- **CID linking**: Stores subtitle CIDs as metadata on the source video
+On the **video record**, per extracted file `<subCid>` (midhash256 of its bytes) in `<lang3>` (ISO 639-2/B — `fre`, `ger`, `chi` — normalised the same way meta-watch does; `und` when the stream declares no language):
 
-## Dependencies
+| Key | Value |
+|-----|-------|
+| `subtitles/<lang3>/<subCid>` | `"true"` — the leaf meta-watch lists |
+| `extractedSubtitles/<lang3>/<subCid>` | `"true"` — provenance: came out of the container |
+| `subtitleLanguages/<lang3>` | `"true"` (not for `und`) |
+| `languages/<lang3>` | `"true"` (not for `und`) |
 
-This plugin requires the following plugins to run first:
-- `file-info` - Determines file type
-- `ffmpeg` - Provides subtitle stream information
+On the **subtitle file's own record**: `videos/<videoCid> = "true"` and `subtitleLanguage = <lang3>` (not for `und`).
 
-## Installation
+Writes are a single `PATCH /meta/{cid}` carrying only keys the record does not already hold; a failed write fails the task. Legacy comma-joined scalars written by the old version (`extractedSubtitles`, `subtitleLanguages`, `subtitles`) are deleted first — a scalar next to `field/...` keys breaks meta-sort's nested document.
 
-### Build from source
+## Behaviour
 
-```bash
-cd packages/plugins/metamesh-plugin-subtitle-extractor
-npm install
-npm run build
-```
-
-### Build Docker image
-
-```bash
-docker build -t metamesh-plugin-subtitle-extractor:main .
-```
-
-### Configure in plugins.yml
-
-Add to `dev/plugins.yml`:
-
-```yaml
-plugins:
-  subtitle-extractor:
-    enabled: true
-    image: metamesh-plugin-subtitle-extractor:main
-    instances: 1
-    resources:
-      memory: 256m
-      cpus: 0.5
-```
+- Reads the ffmpeg plugin's stream table in any shape: meta-sort's nested `stream` array (JSON strings or objects), an index-keyed object, a JSON string, or meta-core's flat `stream/{n}`.
+- **One ffmpeg pass** extracts every text track (one `-map`/output per track). Subtitle packets are interleaved through the whole container, so that pass is still one full read of the video over WebDAV — but one, not one per track. If the shared pass fails, tracks are retried one by one.
+- Image codecs (PGS, VobSub, DVB, teletext, XSUB) are skipped explicitly; other unknown codecs are skipped and logged.
+- Skips a video that already carries the `extractedSubtitles` key-set (unless `forceRecompute`), and reuses an output file that already exists instead of re-reading the video.
+- Output: `/files/plugin/subtitle-extractor/<Title> (<Year>)[<videoCid>]_subtitle.s<streamIndex>.<lang3>[.forced].<ext>` — the stream index keeps two tracks in one language apart.
+- WebDAV endpoint resolved per request from the driving meta-core (`/urls` → `webdavUrlInternal`); `WEBDAV_URL` overrides.
 
 ## Configuration
 
 | Option | Type | Default | Description |
 |--------|------|---------|-------------|
-| `forceRecompute` | boolean | `false` | Re-extract subtitles even if already processed |
-| `outputFormat` | select | `srt` | Output format: `srt`, `vtt`, or `ass` |
+| `forceRecompute` | boolean | `false` | Re-extract even if already processed |
+| `outputFormat` | select | `native` | `native` keeps ASS as ASS (stream copy) and SubRip/WebVTT as-is, converts mov_text to SRT; `srt`, `vtt`, `ass` convert everything |
+| `extractionTimeoutMs` | number | `270000` | Timeout of the single ffmpeg pass |
 
-## Output
+## Supported codecs
 
-### Extracted Files
+Text (extracted): `subrip`/`srt`, `ass`, `ssa`, `webvtt`, `mov_text`, `text`.
+Image (skipped): `hdmv_pgs_subtitle`, `dvd_subtitle`, `dvb_subtitle`, `dvb_teletext`, `xsub`.
 
-Subtitle files are saved to `/output` with the naming pattern:
+## Tests
 
+```bash
+pnpm install && pnpm test        # locally (ffmpeg tests need ffmpeg + ./test/fixtures/generate-test-fixtures.sh)
+./test.sh                        # in Docker, fixtures generated in the image
 ```
-{Title} ({Year})[{VideoCID}]_subtitle.{lang}.{ext}
-```
-
-Example: `Sintel (2010)[bafk...abc]_subtitle.eng.srt`
-
-### Metadata
-
-The plugin stores the following metadata on the source video:
-
-| Field | Type | Description |
-|-------|------|-------------|
-| `extractedSubtitles` | array | CIDs of extracted subtitle files |
-| `subtitleLanguages` | array | Language codes of extracted subtitles |
-
-## Supported Codecs
-
-### Text-based (supported)
-- `subrip` / `srt` - SubRip
-- `ass` - Advanced SubStation Alpha
-- `ssa` - SubStation Alpha
-- `webvtt` - WebVTT
-- `mov_text` - QuickTime text
-
-### Image-based (skipped)
-- `hdmv_pgs_subtitle` - Blu-ray PGS
-- `dvd_subtitle` - DVD VOB
-- `dvb_subtitle` - DVB
-- `xsub` - DivX XSUB
-
-## Architecture
-
-```
-Video File (MKV/MP4/AVI)
-        │
-        ▼
-┌───────────────────┐
-│ ffmpeg plugin     │  ← Provides stream info
-└───────────────────┘
-        │
-        ▼
-┌───────────────────┐
-│ subtitle-extractor│
-│                   │
-│  1. Parse streams │
-│  2. Filter codecs │
-│  3. Extract via   │
-│     ffmpeg        │
-│  4. Save to       │
-│     /output       │
-│  5. Compute CID   │
-│  6. Store in      │
-│     Redis         │
-└───────────────────┘
-        │
-        ▼
-┌───────────────────┐
-│ /output folder    │  ← Watched by meta-sort
-│ *.srt files       │
-└───────────────────┘
-        │
-        ▼
-┌───────────────────┐
-│ meta-sort         │  ← Processes extracted files
-│ file watcher      │     like any other media
-└───────────────────┘
-```
-
-## Container Mounts
-
-| Mount | Access | Purpose |
-|-------|--------|---------|
-| `/files` | READ-ONLY | Source video files |
-| `/cache` | READ-WRITE | Plugin cache |
-| `/output` | READ-WRITE | Extracted subtitle output |
 
 ## Environment Variables
 
 | Variable | Description |
 |----------|-------------|
 | `PORT` | HTTP server port (default: 8080) |
-| `WEBDAV_URL` | WebDAV base URL for file access |
-
-## API Endpoints
-
-| Endpoint | Method | Description |
-|----------|--------|-------------|
-| `/health` | GET | Health check |
-| `/manifest` | GET | Plugin manifest |
-| `/configure` | POST | Update configuration |
-| `/process` | POST | Process a video file |
+| `WEBDAV_URL` | Optional WebDAV override (otherwise resolved from the meta-core `/urls`) |
+| `CACHE_PATH` | Temp root (default `/cache`; files go to `$CACHE_PATH/temp`) |
 
 ## License
 
