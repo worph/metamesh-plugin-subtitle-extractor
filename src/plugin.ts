@@ -499,7 +499,14 @@ export function legacySubtitleMigration(existingMeta: Record<string, unknown> | 
     const langs = legacyCsvMembers(existingMeta, 'subtitleLanguages');
     if (langs) {
         deletes.push('subtitleLanguages');
-        for (const l of langs.map(toLang3)) if (l !== 'und') sets[`subtitleLanguages/${l}`] = 'true';
+        for (const l of langs.map(toLang3)) {
+            if (l === 'und') continue;
+            sets[`subtitleLanguages/${l}`] = 'true';
+            // …and the union (§9 rule #7). The live write path below already
+            // does this; the migration path did not, so records that only ever
+            // went through it were left half-written.
+            sets[`languages/${l}`] = 'true';
+        }
     }
 
     const subs = legacyCsvMembers(existingMeta, 'subtitles');

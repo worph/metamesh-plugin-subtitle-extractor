@@ -310,7 +310,13 @@ describe('legacySubtitleMigration', () => {
             subtitles: 'cidS',
         })).toEqual({
             deletes: ['extractedSubtitles', 'subtitleLanguages', 'subtitles'],
-            sets: { 'subtitleLanguages/eng': 'true', 'subtitleLanguages/fre': 'true', 'subtitles/und/cidS': 'true' },
+            sets: {
+                'subtitleLanguages/eng': 'true',
+                'languages/eng': 'true',
+                'subtitleLanguages/fre': 'true',
+                'languages/fre': 'true',
+                'subtitles/und/cidS': 'true',
+            },
         });
     });
 
