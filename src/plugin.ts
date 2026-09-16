@@ -477,9 +477,21 @@ export function videoSubtitleKeys(produced: ProducedSubtitle[]): Record<string, 
     return keys;
 }
 
-/** Keys on the subtitle file's own record. */
+/**
+ * Keys on the subtitle file's own record.
+ *
+ * `source/extract` (METADATA_KEYS.md §5) says the bytes came out of a video
+ * container. The video record already implies it through `extractedSubtitles/`,
+ * but that is the wrong side of the relation to store it on: a subtitle fetched
+ * over the swarm by CID arrives WITHOUT its video record, so a reader holding
+ * only the file would have no way to tell an extracted track from a sidecar
+ * someone dropped next to the video.
+ */
 export function subtitleRecordKeys(videoCid: string, lang3: string): Record<string, string> {
-    const keys: Record<string, string> = { [`videos/${videoCid}`]: 'true' };
+    const keys: Record<string, string> = {
+        [`videos/${videoCid}`]: 'true',
+        'source/extract': 'true',
+    };
     if (lang3 !== 'und') keys.subtitleLanguage = lang3;
     return keys;
 }

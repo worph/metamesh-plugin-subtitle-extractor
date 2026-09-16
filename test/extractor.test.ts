@@ -284,9 +284,16 @@ describe('record keys (METADATA_KEYS.md §8)', () => {
         expect(keys.every((k) => k.split('/').length === 3)).toBe(true);
     });
 
-    it('subtitle record carries the back-pointer and a determined language only', () => {
-        expect(subtitleRecordKeys('bagvideo', 'fre')).toEqual({ 'videos/bagvideo': 'true', subtitleLanguage: 'fre' });
-        expect(subtitleRecordKeys('bagvideo', 'und')).toEqual({ 'videos/bagvideo': 'true' });
+    it('subtitle record carries the back-pointer, its origin, and a determined language only', () => {
+        expect(subtitleRecordKeys('bagvideo', 'fre')).toEqual({
+            'videos/bagvideo': 'true',
+            'source/extract': 'true',
+            subtitleLanguage: 'fre',
+        });
+        expect(subtitleRecordKeys('bagvideo', 'und')).toEqual({
+            'videos/bagvideo': 'true',
+            'source/extract': 'true',
+        });
     });
 });
 
@@ -501,8 +508,17 @@ describe.skipIf(!ffmpegReady)('process — end to end against a fake core', () =
         expect(video.subtitleLanguages).toBeUndefined();
         expect(video['subtitleLanguages/und']).toBeUndefined();
 
-        expect(core.records.get(fre)).toEqual({ [`videos/${VIDEO_CID}`]: 'true', subtitleLanguage: 'fre' });
-        expect(core.records.get(und)).toEqual({ [`videos/${VIDEO_CID}`]: 'true' });
+        // `source/extract` rides on the subtitle's OWN record, so a peer that
+        // fetched only the file can still tell it came out of a container.
+        expect(core.records.get(fre)).toEqual({
+            [`videos/${VIDEO_CID}`]: 'true',
+            'source/extract': 'true',
+            subtitleLanguage: 'fre',
+        });
+        expect(core.records.get(und)).toEqual({
+            [`videos/${VIDEO_CID}`]: 'true',
+            'source/extract': 'true',
+        });
 
         // The video PATCH carried only new keys — nothing the record already had.
         const patch = writesTo(core, VIDEO_CID).find((c) => c.method === 'PATCH')!;
